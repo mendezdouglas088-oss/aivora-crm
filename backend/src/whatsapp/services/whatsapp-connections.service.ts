@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { UsersService } from 'src/users/users.service';
 import { WhatsappConnections } from 'src/database/entities/whatsapp-conections.entity';
+import { WhatsappConnectionStatus } from 'shared/whatsapp-contracts';
 
 @Injectable()
 export class WhatsappConnectionsService {
@@ -64,5 +65,12 @@ export class WhatsappConnectionsService {
     return this.repo.findOne({
       where: { connectionId },
     });
+  }
+
+  async updateStatus(
+    connectionId: string,
+    status: WhatsappConnectionStatus,
+  ): Promise<void> {
+    await this.repo.update({ connectionId }, { status });
   }
 }

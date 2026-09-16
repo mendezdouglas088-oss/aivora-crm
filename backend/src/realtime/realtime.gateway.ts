@@ -26,7 +26,7 @@ export class RealtimeGateway implements OnGatewayConnection {
       const payload = await this.jwtService.verifyAsync(token);
       client.data.userId = payload.id;
     } catch {
-      client.disconnect(); // sin token válido, ni se conecta
+      client.disconnect();
     }
   }
   emitNewMessages(
@@ -43,7 +43,21 @@ export class RealtimeGateway implements OnGatewayConnection {
       .emit('whatsapp:unread-total', { sessionId, total: unreadTotal });
   }
 
-  // agregar a la clase RealtimeGateway
+  emitChatUpdated(
+    connectionId: string,
+    payload: {
+      chatId: string;
+      isGroup: boolean;
+      name: string;
+      lastMessage: string;
+      lastMessageAt: number;
+      unreadCount: number;
+      fromMe: boolean;
+    },
+  ) {
+    this.server.to(connectionId).emit('whatsapp:chat-updated', payload);
+  }
+
   emitNewChat(
     sessionId: string,
     chat: { chatId: string; name: string; unreadCount: number },
@@ -69,7 +83,7 @@ export class RealtimeGateway implements OnGatewayConnection {
       connectionId,
       client.data.userId,
     );
-    if (!owns) return; // ignora, no le deja unirse a una sala ajena
+    if (!owns) return;
     client.join(connectionId);
   }
 

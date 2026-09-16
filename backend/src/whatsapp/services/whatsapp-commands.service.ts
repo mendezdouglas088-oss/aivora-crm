@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import Redis from 'ioredis';
-import { bullConfig } from 'src/config/bullmq.config';
+import { redisOptions } from 'src/config/bullmq.config';
 import {
   SendResultInterface,
   WhatsappChatSummary,
@@ -8,10 +8,11 @@ import {
   WhatsappConnectionStatus,
   WhatsappContact,
   WhatsappMediaPayload,
+  WhatsappRawMessage,
   WhatsappQrCacheValue,
   whatsappQrKey,
   whatsappStatusKey,
-} from './../../shared/whatsapp-contracts';
+} from 'shared/whatsapp-contracts';
 import { WhatsappCommandsQueue } from '../infrastructure/jobs/whatsapp-commands.queue';
 
 /**
@@ -37,7 +38,7 @@ export class WhatsappCommandsService implements OnModuleDestroy {
   constructor(private readonly commandsQueue: WhatsappCommandsQueue) {
     // Mismas credenciales que ya usa BullMQ (src/config/bullmq.config.ts),
     // pero como cliente de lectura simple, sin nada de colas.
-    this.redis = new Redis(bullConfig.connection);
+    this.redis = new Redis(redisOptions);
   }
 
   async onModuleDestroy() {
@@ -156,5 +157,29 @@ export class WhatsappCommandsService implements OnModuleDestroy {
       { type: 'sync-all', connectionId },
       { timeoutMs: 60_000, attempts: 3 },
     );
+  }
+
+  async getChatMessages(
+    connectionId: string,
+    chatId: string,
+    limit = 50,
+  ): Promise<WhatsappRawMessage[]> {
+    return this.commandsQueue.send(
+      { type: 'get-chat-messages', connectionId, chatId, limit },
+      { timeoutMs: 45_000, attempts: 3 },
+    );
+  }
+
+  async deleteChat(
+    connectionId: string,
+    chatId: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    // attempts: 1 — si ya se borró y reintentamos, whatsapp-web.js puede
+    // fallar con "chat not found", que no es un error real en ese caso.
+    return this.commandsQueue.send({
+      type: 'delete-chat',
+      connectionId,
+      chatId,
+    });
   }
 }

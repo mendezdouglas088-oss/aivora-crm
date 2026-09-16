@@ -2,9 +2,9 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Body,
   Query,
-  Inject,
   Res,
   UseGuards,
   Req,
@@ -13,10 +13,6 @@ import {
   Param,
   HttpStatus,
 } from '@nestjs/common';
-import {
-  WHATSAPP_PROVIDER,
-  WhatsappProvider,
-} from '../domain/whatsapp-provider.interface';
 import { Response } from 'express';
 import { JwtAuthGuard } from 'src/auth/guards/jwt-auth.guard';
 import { WhatsappGroupService } from '../services/whatsapp-group.service';
@@ -24,13 +20,13 @@ import { WhatsappChatService } from '../services/whatsapp-chat.service';
 import { WhatsappMessageService } from '../services/whatsapp-message.service';
 import { RealtimeGateway } from 'src/realtime/realtime.gateway';
 import { WhatsappSyncQueue } from '../infrastructure/jobs/whatsapp-sync.queue';
-import { tryCatch } from 'bullmq';
+import { WhatsappCommandsService } from '../services/whatsapp-commands.service';
 
 @UseGuards(JwtAuthGuard)
 @Controller('whatsapp')
 export class WhatsappController {
   constructor(
-    @Inject(WHATSAPP_PROVIDER) private readonly provider: WhatsappProvider,
+    private readonly commands: WhatsappCommandsService,
     private readonly whatsappGroupService: WhatsappGroupService,
     private readonly chatsService: WhatsappChatService,
     private readonly messageService: WhatsappMessageService,
@@ -40,8 +36,7 @@ export class WhatsappController {
 
   @Post('connect')
   async connect(@Query('connectionId') connectionId: string) {
-    await this.provider.connect(connectionId);
-    return { status: this.provider.getStatus(connectionId) };
+    return this.commands.connect(connectionId); // ya devuelve { status }
   }
 
   @Get('qr')
@@ -49,13 +44,19 @@ export class WhatsappController {
     @Query('connectionId') connectionId: string,
     @Res() res: Response,
   ) {
-    const status = this.provider.getStatus(connectionId);
+    const status = await this.commands.getStatus(connectionId);
 
-    if (['disconnected', 'error', 'auth_failed'].includes(status)) {
-      await this.provider.connect(connectionId); // crea la sesión si no existe
+    // 'connecting' se agrega como red de seguridad extra: connect() ya es
+    // idempotente (no hace nada si hay una sesión real en curso en este
+    // mismo proceso), así que no duplica trabajo, pero cubre el caso de un
+    // 'connecting' que quedó colgado sin más eventos.
+    if (
+      ['disconnected', 'error', 'auth_failed', 'connecting'].includes(status)
+    ) {
+      await this.commands.connect(connectionId); // crea la sesión si no existe
     }
 
-    const qr = await this.provider.getQr(connectionId);
+    const qr = await this.commands.getQr(connectionId);
     if (!qr) {
       res
         .status(202)
@@ -94,13 +95,13 @@ export class WhatsappController {
 
   @Post('logout')
   async logout(@Query('connectionId') connectionId: string) {
-    await this.provider.logout(connectionId);
+    await this.commands.logout(connectionId);
     return { status: 'disconnected' };
   }
 
   @Get('status')
-  getStatus(@Query('connectionId') connectionId: string) {
-    const status = this.provider.getStatus(connectionId ?? '');
+  async getStatus(@Query('connectionId') connectionId: string) {
+    const status = await this.commands.getStatus(connectionId ?? '');
     return { status };
   }
 
@@ -110,11 +111,34 @@ export class WhatsappController {
     return { queued: true };
   }
 
+  /**
+   * ANTES: llamaba `provider.getGroups(connectionId)` directo sobre el
+   * Client vivo. Eso ya no es posible desde la API (el Client vive en el
+   * runtime). Se une al mismo camino que `/whatsapp/sync`: encola un
+   * sync-all en background y devuelve el estado actual en BD — el frontend
+   * se entera de los grupos nuevos por el evento de socket 'whatsapp:new-group'
+   * (emitNewGroup, disparado desde whatsapp-sync.service.ts).
+   *
+   * CAMBIO DE COMPORTAMIENTO: antes la respuesta era síncrona y 100% fresca;
+   * ahora es "dispara refresco + devuelve lo último que hay en BD".
+   */
   @Get('update-groups')
-  async updateGroups(@Query('connectionId') connectionId: string) {
-    const groups = await this.provider.getGroups(connectionId ?? '');
-    await this.whatsappGroupService.create(groups, connectionId);
-    return groups;
+  async updateGroups(
+    @Req() req: any,
+    @Query('connectionId') connectionId: string,
+  ) {
+    try {
+      await this.syncQueue.enqueueFullSync(connectionId);
+      return await this.whatsappGroupService.findAllById(
+        req.user.id,
+        connectionId,
+      );
+    } catch (error) {
+      return {
+        status: error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+        message: error.message,
+      };
+    }
   }
 
   @Get('groups')
@@ -124,6 +148,8 @@ export class WhatsappController {
   ) {
     try {
       const user = req.user;
+      this.syncQueue.enqueueSync(connectionId).catch(() => {}); // refresco en background, no bloquea la respuesta
+
       return await this.whatsappGroupService.findAllById(user.id, connectionId);
     } catch (error) {
       return {
@@ -137,7 +163,7 @@ export class WhatsappController {
   async sendMessage(
     @Body() body: { connectionId: string; chatId: string; message: string },
   ) {
-    return await this.provider.sendText(
+    return await this.commands.sendText(
       body.connectionId,
       body.chatId,
       body.message,
@@ -154,7 +180,7 @@ export class WhatsappController {
       caption?: string;
     },
   ) {
-    return await this.provider.sendImages(
+    return await this.commands.sendImages(
       body.connectionId,
       body.groupId,
       body.imageUrls,
@@ -174,7 +200,7 @@ export class WhatsappController {
       caption?: string;
     },
   ) {
-    return await this.provider.sendMedia(
+    return await this.commands.sendMedia(
       body.connectionId,
       body.chatId,
       { mimetype: body.mimetype, data: body.data, filename: body.filename },
@@ -187,7 +213,7 @@ export class WhatsappController {
     @Query('connectionId') connectionId: string,
     @Param('messageId') messageId: string,
   ) {
-    return await this.provider.getMedia(connectionId, messageId);
+    return await this.commands.getMedia(connectionId, messageId);
   }
 
   @Get('chats/new')
@@ -207,6 +233,32 @@ export class WhatsappController {
   @Get('chats/unregistered')
   async getUnregisteredChats(@Query('connectionId') connectionId: string) {
     return this.chatsService.findUnregistered(connectionId);
+  }
+
+  /**
+   * Borra el chat de WhatsApp real (como "Eliminar chat" en la app — no
+   * borra mensajes del lado del otro contacto) y de la BD (chat + mensajes).
+   * Si el runtime no está conectado o falla el borrado remoto, igual se
+   * limpia la BD — se informa el error de WhatsApp en la respuesta para que
+   * el frontend pueda avisar que puede requerir borrado manual.
+   */
+  @Delete('chats/:chatId')
+  async deleteChat(
+    @Query('connectionId') connectionId: string,
+    @Param('chatId') chatId: string,
+  ) {
+    const whatsappResult = await this.commands
+      .deleteChat(connectionId, chatId)
+      .catch((e) => ({ ok: false, error: e.message }));
+
+    await this.messageService.deleteAllForChat(connectionId, chatId);
+    await this.chatsService.deleteChat(connectionId, chatId);
+
+    return {
+      removedFromDb: true,
+      removedFromWhatsapp: whatsappResult.ok,
+      whatsappError: whatsappResult.ok ? undefined : whatsappResult.error,
+    };
   }
 
   @Get('groups/:groupId/messages')

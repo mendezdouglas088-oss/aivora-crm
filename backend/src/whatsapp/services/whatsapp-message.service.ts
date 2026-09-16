@@ -55,4 +55,8 @@ export class WhatsappMessageService {
       groupTitle: titleByGroupId.get(m.chatId) ?? null,
     }));
   }
+
+  async deleteAllForChat(sessionId: string, chatId: string): Promise<void> {
+    await this.messageRepo.delete({ sessionId, chatId });
+  }
 }

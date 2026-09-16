@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist-runtime",
+    "declaration": false
+  },
+  "exclude": ["node_modules"],
+  "include": ["runtime/src/**/*", "shared/**/*", "src/config/**/*"]
+}

@@ -51,4 +51,8 @@ export class WhatsappChatService {
       order: { lastMessageAt: { direction: 'DESC', nulls: 'LAST' } },
     });
   }
+
+  async deleteChat(sessionId: string, chatId: string): Promise<void> {
+    await this.chatRepo.delete({ sessionId, chatId });
+  }
 }

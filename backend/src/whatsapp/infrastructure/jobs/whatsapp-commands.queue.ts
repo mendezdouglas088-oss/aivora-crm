@@ -7,7 +7,7 @@ import {
   WHATSAPP_COMMANDS_QUEUE,
   WhatsappCommand,
   WhatsappCommandResult,
-} from './../../../shared/whatsapp-contracts';
+} from 'shared/whatsapp-contracts';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
