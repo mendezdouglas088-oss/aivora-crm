@@ -1,11 +1,13 @@
 import { NestFactory } from '@nestjs/core';
 import { RuntimeModule } from './runtime.module';
+import { Logger } from '@nestjs/common';
 
 process.on('unhandledRejection', (reason) => {
   console.error('unhandledRejection en whatsapp-runtime:', reason);
 });
 
 async function bootstrap() {
+  const logger = new Logger('whatsapp-Runtime');
   // Este proceso no sirve HTTP — no hay controllers ni frontend que lo
   // consuma directamente, solo @Processor de BullMQ. createApplicationContext
   // levanta el contenedor de DI de Nest sin Express/Fastify ni puerto.
@@ -17,7 +19,7 @@ async function bootstrap() {
   // reiniciarlo (Fase 5, reinicio programado contra el memory leak).
   app.enableShutdownHooks();
 
-  console.log('whatsapp-runtime listo, esperando comandos en la cola...');
+  logger.log('whatsapp-runtime listo, esperando comandos en la cola...');
 }
 
 bootstrap();
