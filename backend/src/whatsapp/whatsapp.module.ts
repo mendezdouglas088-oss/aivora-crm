@@ -5,11 +5,8 @@ import { BullModule } from '@nestjs/bullmq';
 
 import { WhatsappController } from './controllers/whatsapp.controller';
 import { WhatsappGroup } from 'src/database/entities/whatsapp-group.entity';
-import { WhatsappScheduler } from './whatsapp.scheduler';
 import { ConfigModule } from 'src/config/config.module';
 import { UsersModule } from 'src/users/users.module';
-import { WHATSAPP_PROVIDER } from './domain/whatsapp-provider.interface';
-import { WhatsappWebProvider } from './infrastructure/whatsapp-web.provider';
 import { AuthModule } from 'src/auth/auth.module';
 import { WhatsappGroupService } from './services/whatsapp-group.service';
 import { WhatsappConnectionsService } from './services/whatsapp-connections.service';
@@ -28,9 +25,23 @@ import { WhatsappRegisteredContact } from 'src/database/entities/whatsapp-regist
 import { WhatsappRegisteredContactsService } from './services/whatsapp-registered-contact.service';
 import { WhatsappRegisteredContactsController } from './controllers/whatsapp-registered-contacts.controller';
 
+// ── nuevo en la Fase 1 ──────────────────────────────────────────────
+import {
+  WHATSAPP_COMMANDS_QUEUE,
+  WHATSAPP_PERSIST_EVENTS_QUEUE,
+} from 'shared/whatsapp-contracts';
+import { WhatsappCommandsQueue } from './infrastructure/jobs/whatsapp-commands.queue';
+import { WhatsappCommandsService } from './services/whatsapp-commands.service';
+import { WhatsappPersistEventsProcessor } from './infrastructure/whatsapp-persist-events.processor';
+import { WhatsappLiveEventsBridge } from './infrastructure/whatsapp-live-events.bridge';
+
 @Module({
   imports: [
-    BullModule.registerQueue({ name: 'whatsapp-sync' }),
+    BullModule.registerQueue(
+      { name: 'whatsapp-sync' },
+      { name: WHATSAPP_COMMANDS_QUEUE }, // WhatsappCommandsQueue la usa como productor
+      { name: WHATSAPP_PERSIST_EVENTS_QUEUE }, // WhatsappPersistEventsProcessor la consume
+    ),
     HttpModule,
     TypeOrmModule.forFeature([
       WhatsappGroup,
@@ -47,7 +58,6 @@ import { WhatsappRegisteredContactsController } from './controllers/whatsapp-reg
   providers: [
     WhatsappGroupService,
     WhatsappConnectionsService,
-    WhatsappScheduler,
     WhatsappEventsListener,
     WhatsappSyncService,
     WhatsappSyncProcessor,
@@ -55,11 +65,14 @@ import { WhatsappRegisteredContactsController } from './controllers/whatsapp-reg
     WhatsappChatService,
     WhatsappMessageService,
     WhatsappRegisteredContactsService,
-    { provide: WHATSAPP_PROVIDER, useClass: WhatsappWebProvider },
+    // reemplazan a WhatsappScheduler + { provide: WHATSAPP_PROVIDER, ... }
+    WhatsappCommandsQueue,
+    WhatsappCommandsService,
+    WhatsappPersistEventsProcessor,
+    WhatsappLiveEventsBridge,
   ],
   exports: [
     WhatsappGroupService,
-    WHATSAPP_PROVIDER,
     WhatsappConnectionsService,
     WhatsappSyncService,
     WhatsappSyncProcessor,
@@ -67,6 +80,8 @@ import { WhatsappRegisteredContactsController } from './controllers/whatsapp-reg
     WhatsappChatService,
     WhatsappMessageService,
     WhatsappRegisteredContactsService,
+    // reemplaza el WHATSAPP_PROVIDER exportado antes (lo usa publication.scheduler.ts)
+    WhatsappCommandsService,
   ],
   controllers: [
     WhatsappController,

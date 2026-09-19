@@ -10,6 +10,7 @@ import {
 } from 'typeorm';
 import { User } from './user.entity';
 import { WhatsappGroup } from './whatsapp-group.entity';
+import { WhatsappConnectionStatus } from 'shared/whatsapp-contracts';
 
 @Entity('whatsapp_connections')
 export class WhatsappConnections {
@@ -33,6 +34,9 @@ export class WhatsappConnections {
   // envia al frontend para que el usuario pueda escanear el QR y conectarse a su cuenta de whatsapp
   @Column({ nullable: true, unique: true })
   connectionId: string;
+
+  @Column({ type: 'varchar', default: 'disconnected' })
+  status: WhatsappConnectionStatus;
 
   @OneToMany(
     () => WhatsappGroup,

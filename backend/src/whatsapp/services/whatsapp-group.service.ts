@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { WhatsappGroup } from 'src/database/entities/whatsapp-group.entity';
 import { QueryFailedError, Repository } from 'typeorm';
 import { UsersService } from 'src/users/users.service';
-import { WhatsappGroupInterface } from '../domain/whatsapp-provider.interface';
+import { WhatsappGroupInterface } from 'shared/whatsapp-contracts';
 import { WhatsappConnectionsService } from './whatsapp-connections.service';
 
 @Injectable()
@@ -52,6 +52,8 @@ export class WhatsappGroupService {
           where: {
             whatsappConnection: { userId },
           },
+
+          order: { lastMessageAt: { direction: 'DESC', nulls: 'LAST' } },
         });
       }
 
@@ -59,6 +61,8 @@ export class WhatsappGroupService {
         where: {
           whatsappConnection: { connectionId, userId },
         },
+
+        order: { lastMessageAt: { direction: 'DESC', nulls: 'LAST' } },
       });
     } catch (error) {
       if (error instanceof QueryFailedError) {
@@ -71,7 +75,9 @@ export class WhatsappGroupService {
   }
 
   async findAll() {
-    return await this.repoWhatsappGroup.find();
+    return await this.repoWhatsappGroup.find({
+      order: { lastMessageAt: { direction: 'DESC', nulls: 'LAST' } },
+    });
   }
 
   reconstructFullId(numericId: string): string {
