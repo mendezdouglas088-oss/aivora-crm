@@ -1,4 +1,6 @@
 ```
+> ARQUITECTURA PREVISTA
+
 project-root/
 ├── src/                                              (API — se queda donde está)
 │   ├── main.ts                                            [SIN CAMBIOS]
