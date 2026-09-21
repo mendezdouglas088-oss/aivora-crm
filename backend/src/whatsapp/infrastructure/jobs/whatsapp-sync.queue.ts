@@ -7,14 +7,18 @@ export class WhatsappSyncQueue {
   constructor(@InjectQueue('whatsapp-sync') private readonly queue: Queue) {}
 
   async enqueueSync(sessionId: string) {
+    // jobId fijo: si ya hay un sync de esta conexión esperando/en curso, BullMQ
+    // ignora el nuevo. Antes cada GET /chats y /groups apilaba otro sync-all.
+    // removeOnFail: true — un job fallido con el mismo id bloquearía los siguientes.
     await this.queue.add(
       'sync-all',
       { sessionId },
       {
+        jobId: `sync-${sessionId}`,
         attempts: 4,
         backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: true,
-        removeOnFail: 50,
+        removeOnFail: true,
       },
     );
   }
@@ -24,10 +28,11 @@ export class WhatsappSyncQueue {
       'sync-all',
       { sessionId },
       {
+        jobId: `sync-${sessionId}`,
         attempts: 4,
         backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: true,
-        removeOnFail: 50,
+        removeOnFail: true,
       },
     );
   }

@@ -57,6 +57,13 @@ export class WhatsappController {
     }
 
     const qr = await this.commands.getQr(connectionId);
+
+    // 'waiting_qr' pero sin QR en Redis = estado huérfano (runtime caído o
+    // reiniciado). Antes nadie hacía nada y el front recibía 202 para siempre.
+    if (!qr && status === 'waiting_qr') {
+      await this.commands.connect(connectionId);
+    }
+
     if (!qr) {
       res
         .status(202)

@@ -4,7 +4,7 @@ import { Job } from 'bullmq';
 import {
   WHATSAPP_COMMANDS_QUEUE,
   WhatsappCommand,
-} from 'shared/whatsapp-contracts';
+} from '../../shared/whatsapp-contracts';
 import { WhatsappRuntimeService } from './whatsapp-runtime.service';
 
 /**
@@ -19,7 +19,11 @@ import { WhatsappRuntimeService } from './whatsapp-runtime.service';
  * — por eso `runtime.module.ts` no encontraba `WhatsappCommandsProcessor`.
  */
 @Injectable()
-@Processor(WHATSAPP_COMMANDS_QUEUE)
+// Concurrencia > 1 (por defecto BullMQ procesa de a UN job): antes un sync-all
+// lento dejaba en espera connect/send-text/etc. y la API los daba por
+// caídos a los 30 s. Los comandos son independientes entre sí y
+// WhatsappBaileysProvider.connect() ya es seguro ante llamadas simultáneas.
+@Processor(WHATSAPP_COMMANDS_QUEUE, { concurrency: 5 })
 export class WhatsappCommandsProcessor extends WorkerHost {
   private readonly logger = new Logger(WhatsappCommandsProcessor.name);
 
