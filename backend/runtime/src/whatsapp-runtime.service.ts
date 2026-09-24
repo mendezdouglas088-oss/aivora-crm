@@ -26,6 +26,10 @@ import {
   WHATSAPP_LIVE_EVENTS_CHANNEL,
   whatsappStatusKey,
   whatsappQrKey,
+  WhatsappHistoryBatchJob,
+  WhatsappHistoryDoneJob,
+  WHATSAPP_HISTORY_BATCH_JOB_NAME,
+  WHATSAPP_HISTORY_DONE_JOB_NAME,
 } from '../../shared/whatsapp-contracts';
 import { redisOptions } from '../../src/config/bullmq.config';
 import {
@@ -119,6 +123,35 @@ export class WhatsappRuntimeService
     }
     await this.provider.destroyAll();
     this.redis.disconnect();
+  }
+
+  async onHistoryBatchPersist(
+    connectionId: string,
+    messages: WhatsappMessagePersistPayload[],
+  ): Promise<void> {
+    if (!messages.length) return;
+    const job: WhatsappHistoryBatchJob = { messages };
+    await this.persistQueue.add(WHATSAPP_HISTORY_BATCH_JOB_NAME, job, {
+      attempts: 4,
+      backoff: { type: 'exponential', delay: 5000 },
+      removeOnComplete: { count: 1000 },
+      removeOnFail: { count: 1000 },
+    });
+  }
+
+  async onHistorySyncComplete(
+    connectionId: string,
+    totals: { totalChats: number; totalGroups: number },
+  ): Promise<void> {
+    const job: WhatsappHistoryDoneJob = {
+      payload: { connectionId, ...totals },
+    };
+    await this.persistQueue.add(WHATSAPP_HISTORY_DONE_JOB_NAME, job, {
+      attempts: 4,
+      backoff: { type: 'exponential', delay: 5000 },
+      removeOnComplete: { count: 1000 },
+      removeOnFail: { count: 1000 },
+    });
   }
 
   // ── contrato que espera WhatsappCommandsProcessor (sin cambios) ────

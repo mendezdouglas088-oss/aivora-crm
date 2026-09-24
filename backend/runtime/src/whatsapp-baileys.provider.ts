@@ -29,6 +29,13 @@ import {
   WhatsappRawMessage,
 } from '../../shared/whatsapp-contracts';
 import { WhatsappBaileysAuthStore } from './whatsapp-baileys-auth.store';
+import {
+  ChatIdentityMap,
+  isPlaceholderName,
+  jidUser as jidUserOf,
+  toBaileysJid as toBaileysJidOf,
+  toLegacyId as toLegacyIdOf,
+} from './whatsapp-chat-identity';
 
 /**
  * Lo que `WhatsappRuntimeService` tiene que implementar para recibir los
@@ -55,6 +62,23 @@ export interface WhatsappBaileysEventListener {
     connectionId: string,
     event: Omit<WhatsappMessageReceivedEvent, 'kind' | 'connectionId'>,
   ): void | Promise<void>;
+
+  /**
+   * Un lote de mensajes de historial. El provider garantiza el ORDEN: primero
+   * salen todos los lotes de chats 1:1 y solo después los de grupos.
+   */
+  onHistoryBatchPersist(
+    connectionId: string,
+    messages: WhatsappMessagePersistPayload[],
+  ): void | Promise<void>;
+  /**
+   * La importación inicial de historial terminó (ya se emitieron TODOS los
+   * lotes, chats primero y grupos después).
+   */
+  onHistorySyncComplete(
+    connectionId: string,
+    totals: { totalChats: number; totalGroups: number },
+  ): void | Promise<void>;
 }
 
 interface InternalChatEntry extends WhatsappChatSummary {
@@ -62,8 +86,27 @@ interface InternalChatEntry extends WhatsappChatSummary {
   lastMessageTimestamp?: number;
 }
 
+/**
+ * Estado de la importación de historial (`messaging-history.set`) de una
+ * sesión. Baileys entrega el historial en varios bloques mezclando chats y
+ * grupos; aquí se reordena para persistir primero los chats 1:1 y después
+ * los grupos.
+ */
+interface HistoryImportState {
+  /** Serializa los bloques: cada handler es async y sin esto se solaparían. */
+  chain: Promise<void>;
+  /** Hay una importación en curso (llegó ≥1 bloque y aún no se da por terminada). */
+  active: boolean;
+  /** Mensajes de grupos retenidos hasta que terminen de enviarse los de chats. */
+  groupBuffer: WhatsappMessagePersistPayload[];
+  idleTimer?: NodeJS.Timeout;
+}
+
 interface BaileysConnectionSession {
   sock: WASocket;
+  /** Fuente única de verdad para "qué chatId es esta persona" (LID vs PN). */
+  identity: ChatIdentityMap;
+  history: HistoryImportState;
   listener: WhatsappBaileysEventListener;
   loggingOut: boolean;
   chats: Map<string, InternalChatEntry>;
@@ -96,8 +139,19 @@ const GROUPS_REFRESH_MS = 10 * 60_000;
 const GROUP_FORBIDDEN_BLOCK_MS = 6 * 60 * 60_000;
 const GROUP_RATE_LIMIT_BLOCK_MS = 10 * 60_000;
 
-const LEGACY_INDIVIDUAL_SUFFIX = '@c.us';
-const BAILEYS_INDIVIDUAL_SUFFIX = '@s.whatsapp.net';
+// Importación de historial. Baileys no avisa de forma fiable cuándo llegó el
+// ÚLTIMO bloque (`isLatest` es true solo en el PRIMERO: se calcula como
+// `!creds.processedHistoryMessages?.length`), así que se da por terminada
+// cuando FULL reporta progress=100, o tras un rato sin bloques nuevos.
+const HISTORY_IDLE_MS = Number(process.env.WHATSAPP_HISTORY_IDLE_MS) || 30_000;
+const HISTORY_DONE_GRACE_MS = 5_000;
+// Tamaño máximo de mensajes por job/INSERT. Postgres admite 65 535 parámetros
+// por consulta; con ~15 columnas por mensaje, un solo INSERT de más de ~4 300
+// mensajes falla entero (y BullMQ lo reintenta 4 veces y lo pierde).
+const HISTORY_JOB_CHUNK = 500;
+// Tope de mensajes de grupo retenidos en memoria mientras llegan los chats.
+// Si se supera, el exceso se envía sin esperar (se pierde el orden, no datos).
+const HISTORY_GROUP_BUFFER_MAX = 150_000;
 
 /**
  * Reemplaza la parte de `whatsapp-runtime.service.ts` que antes tocaba
@@ -205,7 +259,7 @@ export class WhatsappBaileysProvider {
       },
       logger: this.baileysLogger as any,
       browser: Browsers.ubuntu('Chrome'),
-      syncFullHistory: false,
+      syncFullHistory: true,
       // Con true (default), el celular deja de recibir notificaciones push
       // mientras el runtime esté conectado.
       markOnlineOnConnect: false,
@@ -235,6 +289,8 @@ export class WhatsappBaileysProvider {
 
     const session: BaileysConnectionSession = {
       sock,
+      identity: new ChatIdentityMap(),
+      history: { chain: Promise.resolve(), active: false, groupBuffer: [] },
       listener,
       loggingOut: false,
       chats: new Map(),
@@ -271,6 +327,7 @@ export class WhatsappBaileysProvider {
   /** Cierra todos los sockets sin borrar credenciales — para OnModuleDestroy (SIGTERM/reinicio). */
   async destroyAll(): Promise<void> {
     for (const [connectionId, session] of this.sessions.entries()) {
+      clearTimeout(session.history.idleTimer);
       try {
         session.sock.end(new Error('runtime apagándose'));
       } catch {
@@ -427,6 +484,7 @@ export class WhatsappBaileysProvider {
     chatId: string,
   ): Promise<WhatsappContact> {
     const session = this.requireConnectedSession(connectionId);
+    chatId = session.identity.canonical(chatId);
     const cached = session.contacts.get(chatId);
     if (cached) return cached;
 
@@ -469,9 +527,21 @@ export class WhatsappBaileysProvider {
         );
         participantsCount = metadata?.participants?.length;
       }
+      const groupSubject = chat.isGroup
+        ? session.groupMetadataCache.get(this.toBaileysJid(chat.chatId))
+            ?.subject
+        : undefined;
+      const resolvedName = chat.isGroup
+        ? groupSubject || chat.name
+        : session.contacts.get(chat.chatId)?.name || chat.name;
       summaries.push({
         chatId: chat.chatId,
-        name: chat.name,
+        // otros ids de la misma persona: la API usa esto para fusionar los
+        // chats duplicados que ya estén guardados en la BD
+        aliases: chat.isGroup
+          ? undefined
+          : session.identity.aliasesOf(chat.chatId),
+        name: resolvedName,
         isGroup: chat.isGroup,
         lastMessage: chat.lastMessage,
         lastMessageAt: chat.lastMessageAt,
@@ -503,7 +573,8 @@ export class WhatsappBaileysProvider {
   ): Promise<WhatsappRawMessage[]> {
     this.requireConnectedSession(connectionId);
     const session = this.sessions.get(connectionId)!;
-    const cached = session.messagesByChat.get(chatId) ?? [];
+    const cached =
+      session.messagesByChat.get(session.identity.canonical(chatId)) ?? [];
     return cached.slice(-limit);
   }
 
@@ -514,6 +585,7 @@ export class WhatsappBaileysProvider {
     const session = this.getConnectedSession(connectionId);
     if (!session) return { ok: false, error: 'WhatsApp no está conectado' };
 
+    chatId = session.identity.canonical(chatId);
     const entry = session.chats.get(chatId);
     const baileysJid = this.toBaileysJid(chatId);
 
@@ -570,17 +642,23 @@ export class WhatsappBaileysProvider {
       await this.handleConnectionUpdate(connectionId, session, update);
     });
 
-    sock.ev.on(
-      'messaging-history.set',
-      ({ chats, contacts, messages }: any) => {
-        this.handleHistorySet(
-          connectionId,
-          session,
-          chats ?? [],
-          contacts ?? [],
-          messages ?? [],
+    // Cada bloque se encadena al anterior: el handler es async (resuelve
+    // LIDs, encola jobs) y sin serializar dos bloques se solapan, con lo que
+    // el "historial terminado" podría salir antes de encolar el último lote.
+    sock.ev.on('messaging-history.set', (data: any) => {
+      session.history.chain = session.history.chain
+        .then(() => this.handleHistorySet(connectionId, session, data))
+        .catch((e) =>
+          this.logger.error(
+            `[${connectionId}] error procesando bloque de historial: ${e?.message ?? e}`,
+          ),
         );
-      },
+    });
+
+    // Baileys avisa cuando aprende que un LID y un número son la misma
+    // persona: se fusiona lo que ya se hubiera guardado bajo el LID.
+    sock.ev.on('lid-mapping.update', (m: any) =>
+      this.learnMapping(session, m?.lid, m?.pn),
     );
 
     sock.ev.on('chats.upsert', (chats: any[]) =>
@@ -696,6 +774,17 @@ export class WhatsappBaileysProvider {
 
       this.sessions.delete(connectionId);
 
+      // Si el socket se cae en medio de la importación de historial, lo que
+      // quedó retenido en memoria (grupos) se perdería: se envía ahora.
+      clearTimeout(session.history.idleTimer);
+      if (session.history.active && !session.loggingOut && !loggedOut) {
+        session.history.chain = session.history.chain
+          .then(() =>
+            this.finishHistoryImport(connectionId, session, 'socket cerrado'),
+          )
+          .catch(() => undefined);
+      }
+
       if (session.loggingOut || loggedOut) {
         this.logger.warn(`[${connectionId}] sesión cerrada (logout)`);
         await this.authStore.delete(connectionId);
@@ -731,25 +820,230 @@ export class WhatsappBaileysProvider {
 
   // ── construcción del estado de chats/contactos/mensajes ──────────
 
-  private handleHistorySet(
+  /**
+   * Un bloque de `messaging-history.set`.
+   *
+   * ORDEN: los mensajes de chats 1:1 se encolan apenas llegan; los de grupos
+   * se RETIENEN en memoria y solo se encolan cuando la importación termina
+   * (ver `finishHistoryImport`). Como la cola de persistencia es FIFO, en
+   * la BD primero entra todo el historial de chats y después el de grupos.
+   */
+  private async handleHistorySet(
     connectionId: string,
     session: BaileysConnectionSession,
-    chats: any[],
-    contacts: any[],
-    messages: proto.IWebMessageInfo[],
-  ): void {
-    this.upsertChatsFromBaileys(session, chats);
-    this.handleContactsUpsert(session, contacts);
-    for (const msg of messages) {
-      // 'history': historial re-sincronizado. Solo se cachea en memoria (lo
-      // recoge el sync periódico); no se encola ni cuenta como no leído.
-      this.handleIncomingMessage(connectionId, session, msg, 'history').catch(
-        (e) =>
-          this.logger.debug(
-            `[${connectionId}] error cacheando mensaje de historial: ${e.message}`,
-          ),
+    data: {
+      chats?: any[];
+      contacts?: any[];
+      messages?: proto.IWebMessageInfo[];
+      lidPnMappings?: { lid: string; pn: string }[];
+      syncType?: proto.HistorySync.HistorySyncType | null;
+      progress?: number | null;
+    },
+  ): Promise<void> {
+    const { syncType, progress } = data;
+
+    // Primero los mapeos LID↔PN: así los chats/mensajes de este mismo bloque
+    // ya se resuelven al chatId canónico.
+    for (const m of data.lidPnMappings ?? []) {
+      this.learnMapping(session, m.lid, m.pn);
+    }
+    this.upsertChatsFromBaileys(session, data.chats ?? []);
+    this.handleContactsUpsert(session, data.contacts ?? []);
+
+    const chatBatch: WhatsappMessagePersistPayload[] = [];
+    const groupBatch: WhatsappMessagePersistPayload[] = [];
+    for (const msg of data.messages ?? []) {
+      try {
+        const payload = await this.handleIncomingMessage(
+          connectionId,
+          session,
+          msg,
+          'history',
+        );
+        if (payload) (payload.isGroup ? groupBatch : chatBatch).push(payload);
+      } catch (e) {
+        this.logger.debug(
+          `[${connectionId}] error cacheando mensaje de historial: ${e.message}`,
+        );
+      }
+    }
+
+    // ON_DEMAND (fetchMessageHistory) no es la importación inicial: no
+    // participa del ciclo "chats → grupos → terminado", se persiste directo.
+    const isOnDemand = syncType === proto.HistorySync.HistorySyncType.ON_DEMAND;
+
+    await this.enqueueHistoryMessages(connectionId, session, chatBatch);
+
+    if (isOnDemand) {
+      await this.enqueueHistoryMessages(connectionId, session, groupBatch);
+      return;
+    }
+
+    // Grupos: retenidos hasta que terminen de enviarse los chats.
+    const buffer = session.history.groupBuffer;
+    const room = Math.max(0, HISTORY_GROUP_BUFFER_MAX - buffer.length);
+    buffer.push(...groupBatch.slice(0, room));
+    if (groupBatch.length > room) {
+      this.logger.warn(
+        `[${connectionId}] buffer de grupos lleno (${HISTORY_GROUP_BUFFER_MAX}); ${groupBatch.length - room} mensajes de grupo se envían sin esperar a los chats.`,
+      );
+      await this.enqueueHistoryMessages(
+        connectionId,
+        session,
+        groupBatch.slice(room),
       );
     }
+
+    this.touchHistoryImport(connectionId, session, syncType, progress);
+  }
+
+  /** Parte en jobs de HISTORY_JOB_CHUNK mensajes (ver la constante). */
+  private async enqueueHistoryMessages(
+    connectionId: string,
+    session: BaileysConnectionSession,
+    messages: WhatsappMessagePersistPayload[],
+  ): Promise<void> {
+    for (let i = 0; i < messages.length; i += HISTORY_JOB_CHUNK) {
+      await session.listener.onHistoryBatchPersist(
+        connectionId,
+        messages.slice(i, i + HISTORY_JOB_CHUNK),
+      );
+    }
+  }
+
+  /**
+   * Cada bloque de historial reinicia el temporizador de "terminó". Si el
+   * bloque es FULL con progress=100 (el último de una importación completa)
+   * se cierra casi de inmediato; si no, tras HISTORY_IDLE_MS sin bloques.
+   */
+  private touchHistoryImport(
+    connectionId: string,
+    session: BaileysConnectionSession,
+    syncType?: proto.HistorySync.HistorySyncType | null,
+    progress?: number | null,
+  ): void {
+    const h = session.history;
+    h.active = true;
+    clearTimeout(h.idleTimer);
+
+    const isFullDone =
+      syncType === proto.HistorySync.HistorySyncType.FULL && progress === 100;
+    h.idleTimer = setTimeout(
+      () => {
+        h.chain = h.chain
+          .then(() => this.finishHistoryImport(connectionId, session, 'ok'))
+          .catch((e) =>
+            this.logger.error(
+              `[${connectionId}] error cerrando importación de historial: ${e?.message ?? e}`,
+            ),
+          );
+      },
+      isFullDone ? HISTORY_DONE_GRACE_MS : HISTORY_IDLE_MS,
+    );
+    h.idleTimer.unref?.();
+  }
+
+  /**
+   * Cierra la importación: libera los mensajes de GRUPOS retenidos (los de
+   * chats ya se encolaron en su momento, así que quedan antes en la cola) y
+   * avisa al lado API, que hace la reconciliación final y emite por
+   * WebSocket "chats sincronizados" y luego "grupos sincronizados".
+   */
+  private async finishHistoryImport(
+    connectionId: string,
+    session: BaileysConnectionSession,
+    reason: string,
+  ): Promise<void> {
+    const h = session.history;
+    if (!h.active) return;
+    h.active = false;
+    clearTimeout(h.idleTimer);
+
+    const buffered = h.groupBuffer;
+    h.groupBuffer = [];
+    if (reason !== 'ok') {
+      this.logger.warn(
+        `[${connectionId}] importación de historial cerrada antes de tiempo (${reason}).`,
+      );
+    }
+
+    await this.enqueueHistoryMessages(connectionId, session, buffered);
+
+    const all = [...session.chats.values()];
+    await session.listener.onHistorySyncComplete(connectionId, {
+      totalChats: all.filter((c) => !c.isGroup).length,
+      totalGroups: all.filter((c) => c.isGroup).length,
+    });
+  }
+
+  // ── identidad LID ↔ PN ───────────────────────────────────────────
+
+  /**
+   * Registra que `lid` y `pn` son la misma persona y, si ya había un chat
+   * guardado bajo el LID (el "duplicado vacío"), lo fusiona en el canónico.
+   */
+  private learnMapping(
+    session: BaileysConnectionSession,
+    lid?: string | null,
+    pn?: string | null,
+  ): void {
+    const learned = session.identity.learn(lid, pn);
+    if (learned) this.mergeAliasedChat(session, learned.lid, learned.canonical);
+  }
+
+  private mergeAliasedChat(
+    session: BaileysConnectionSession,
+    aliasId: string,
+    canonicalId: string,
+  ): void {
+    // contactos
+    const aliasContact = session.contacts.get(aliasId);
+    if (aliasContact) {
+      session.contacts.delete(aliasId);
+      const target = session.contacts.get(canonicalId);
+      if (!target) {
+        session.contacts.set(canonicalId, {
+          ...aliasContact,
+          chatId: canonicalId,
+          phoneNumber: this.jidUser(canonicalId),
+        });
+      } else if (isPlaceholderName(target.name, canonicalId, aliasId)) {
+        target.name = aliasContact.name;
+      }
+    }
+
+    // mensajes cacheados en memoria
+    const aliasMsgs = session.messagesByChat.get(aliasId);
+    if (aliasMsgs) {
+      session.messagesByChat.delete(aliasId);
+      const merged = [
+        ...(session.messagesByChat.get(canonicalId) ?? []),
+        ...aliasMsgs,
+      ].sort((a, b) => a.timestamp - b.timestamp);
+      session.messagesByChat.set(
+        canonicalId,
+        merged.slice(-MAX_MESSAGES_PER_CHAT),
+      );
+    }
+
+    // chat
+    const from = session.chats.get(aliasId);
+    if (!from) return;
+    session.chats.delete(aliasId);
+    const to = session.chats.get(canonicalId);
+    if (!to) {
+      session.chats.set(canonicalId, { ...from, chatId: canonicalId });
+      return;
+    }
+    if (isPlaceholderName(to.name, canonicalId, aliasId)) to.name = from.name;
+    to.unreadCount = Math.max(to.unreadCount ?? 0, from.unreadCount ?? 0);
+    if ((from.lastMessageTimestamp ?? 0) > (to.lastMessageTimestamp ?? 0)) {
+      to.lastMessage = from.lastMessage;
+      to.lastMessageKey = from.lastMessageKey;
+      to.lastMessageTimestamp = from.lastMessageTimestamp;
+    }
+    to.lastMessageAt =
+      Math.max(to.lastMessageAt ?? 0, from.lastMessageAt ?? 0) || undefined;
   }
 
   private upsertChatsFromBaileys(
@@ -758,13 +1052,12 @@ export class WhatsappBaileysProvider {
   ): void {
     for (const chat of chats ?? []) {
       if (!chat?.id) continue;
-      // v7: un chat @lid puede traer su PN en `pnJid`; preferirlo mantiene un
-      // único chatId por persona (el mismo que arma handleIncomingMessage).
-      const canonical =
-        isLidUser(chat.id) && chat.pnJid && isPnUser(chat.pnJid)
-          ? chat.pnJid
-          : chat.id;
-      const legacyId = this.toLegacyId(jidNormalizedUser(canonical));
+      // v7: el propio chat puede traer su otro identificador (pnJid/lidJid).
+      if (isLidUser(chat.id)) this.learnMapping(session, chat.id, chat.pnJid);
+      else if (isPnUser(chat.id))
+        this.learnMapping(session, chat.lidJid, chat.id);
+
+      const legacyId = session.identity.canonical(chat.id);
       if (!this.isRealChat(legacyId)) continue;
 
       const existing = session.chats.get(legacyId);
@@ -774,7 +1067,11 @@ export class WhatsappBaileysProvider {
         isGroup: legacyId.endsWith('@g.us'),
         unreadCount: 0,
       };
-      if (chat.name) entry.name = chat.name;
+      if (chat.name) {
+        entry.name = entry.isGroup
+          ? chat.name
+          : session.contacts.get(legacyId)?.name || chat.name;
+      }
       if (typeof chat.unreadCount === 'number')
         entry.unreadCount = chat.unreadCount;
       if (chat.conversationTimestamp) {
@@ -790,14 +1087,18 @@ export class WhatsappBaileysProvider {
   ): void {
     for (const c of contacts ?? []) {
       if (!c?.id) continue;
-      const pn = isLidUser(c.id) && c.phoneNumber ? c.phoneNumber : c.id;
-      const legacyId = this.toLegacyId(jidNormalizedUser(pn));
+      // v7: el contacto puede traer ambos identificadores.
+      const lid = c.lid ?? (isLidUser(c.id) ? c.id : undefined);
+      const pn = c.phoneNumber ?? (isPnUser(c.id) ? c.id : undefined);
+      this.learnMapping(session, lid, pn);
+
+      const legacyId = session.identity.canonical(c.id);
       const existing = session.contacts.get(legacyId);
       const name = c.name || c.notify || existing?.name || this.jidUser(c.id);
       session.contacts.set(legacyId, {
         chatId: legacyId,
         name,
-        phoneNumber: this.jidUser(c.id),
+        phoneNumber: this.jidUser(legacyId.endsWith('@c.us') ? legacyId : c.id),
       });
     }
   }
@@ -807,7 +1108,7 @@ export class WhatsappBaileysProvider {
     session: BaileysConnectionSession,
     msg: proto.IWebMessageInfo,
     upsertType: string,
-  ): Promise<void> {
+  ): Promise<void | WhatsappMessagePersistPayload> {
     if (msg.messageStubType) return; // notificación del sistema (agregado al grupo, etc.), no un mensaje real
 
     const remoteJid = msg.key?.remoteJid;
@@ -846,7 +1147,10 @@ export class WhatsappBaileysProvider {
     //  - 'append'  → offline/eco propio: se persiste (sin evento en vivo).
     //  - 'history' → solo caché en memoria.
     const isLiveMessage = upsertType === 'notify';
-    const shouldPersist = upsertType === 'notify' || upsertType === 'append';
+    const shouldPersist =
+      upsertType === 'notify' ||
+      upsertType === 'append' ||
+      upsertType === 'history';
 
     const fromMe = !!msg.key.fromMe;
     const isGroup = legacyChatId.endsWith('@g.us');
@@ -862,8 +1166,8 @@ export class WhatsappBaileysProvider {
         ),
       );
       authorName =
-        msg.pushName ||
         session.contacts.get(author)?.name ||
+        msg.pushName ||
         this.jidUser(author);
     }
 
@@ -915,7 +1219,10 @@ export class WhatsappBaileysProvider {
       body,
       timestamp,
       fromMe,
-      shouldPersist,
+      // El historial NO suma no-leídos: su contador ya viene en el propio
+      // chat (`chat.unreadCount`); sumarlo aquí lo inflaba con cada mensaje
+      // recibido en el pasado.
+      upsertType !== 'history',
       msg.key,
       !fromMe && !isGroup ? msg.pushName : undefined,
     );
@@ -940,6 +1247,10 @@ export class WhatsappBaileysProvider {
       mentionsMe,
       serializedId: messageId,
     };
+
+    if (upsertType === 'history') {
+      return persistPayload; // handleHistorySet lo agrupa en un batch
+    }
     await session.listener.onMessagePersist(connectionId, persistPayload);
 
     // El evento en vivo ('message-received') solo para tiempo real, no para
@@ -985,13 +1296,22 @@ export class WhatsappBaileysProvider {
     };
     // Chat 1:1 todavía nombrado con el número/LID: usar el nombre que el
     // contacto tiene en su WhatsApp (pushName) si vino en el mensaje.
-    if (pushName && entry.name === this.jidUser(legacyChatId)) {
-      entry.name = pushName;
+    if (entry.name === this.jidUser(legacyChatId)) {
+      const savedName = session.contacts.get(legacyChatId)?.name;
+      if (savedName) entry.name = savedName;
+      else if (pushName) entry.name = pushName;
     }
-    entry.lastMessage = body;
-    entry.lastMessageAt = timestamp;
-    entry.lastMessageKey = lastMessageKey;
-    entry.lastMessageTimestamp = timestamp;
+    // Monótono: el historial no llega ordenado por fecha, y un mensaje viejo
+    // procesado al final dejaba como "último mensaje" el más antiguo.
+    if (
+      entry.lastMessageTimestamp === undefined ||
+      timestamp >= entry.lastMessageTimestamp
+    ) {
+      entry.lastMessage = body;
+      entry.lastMessageKey = lastMessageKey;
+      entry.lastMessageTimestamp = timestamp;
+    }
+    entry.lastMessageAt = Math.max(entry.lastMessageAt ?? 0, timestamp);
     // Aproximación: a diferencia de `chat.unreadCount` de whatsapp-web.js
     // (ya calculado por el propio WhatsApp Web), Baileys no da un contador
     // confiable por cada mensaje individual — se lleva a mano acá y se
@@ -1259,17 +1579,29 @@ export class WhatsappBaileysProvider {
     key: WAMessageKey,
   ): Promise<string> {
     const jid = key.remoteJid ?? '';
-    if (isLidUser(jid)) {
-      let pn: string | null | undefined = key.remoteJidAlt;
-      if (!pn || !isPnUser(pn)) {
-        pn = await session.sock.signalRepository.lidMapping
-          .getPNForLID(jid)
-          .catch(() => null);
-      }
-      if (pn && isPnUser(pn)) return this.toLegacyId(jidNormalizedUser(pn));
-      return jidNormalizedUser(jid);
+    if (!isLidUser(jid)) return session.identity.canonical(jid);
+
+    const lid = jidNormalizedUser(jid);
+    // 1) pista del propio mensaje
+    if (key.remoteJidAlt && isPnUser(key.remoteJidAlt)) {
+      this.learnMapping(session, lid, key.remoteJidAlt);
     }
-    return this.toLegacyId(jidNormalizedUser(jid));
+    // 2) lo que ya se aprendió en esta sesión (chats, contactos, historial)
+    const known = session.identity.canonical(lid);
+    if (known !== lid) return known;
+    // 3) el mapeo persistente de Baileys (con caché de "no lo conoce": en
+    //    una importación de historial esto se llamaba una vez por mensaje)
+    if (!session.identity.recentlyMissed(lid)) {
+      const pn = await session.sock.signalRepository.lidMapping
+        .getPNForLID(lid)
+        .catch(() => null);
+      if (pn && isPnUser(pn)) {
+        this.learnMapping(session, lid, pn);
+        return session.identity.canonical(lid);
+      }
+      session.identity.markMiss(lid);
+    }
+    return lid;
   }
 
   /** Para participantes de grupo: prefiere el PN si el principal es un LID. */
@@ -1279,28 +1611,15 @@ export class WhatsappBaileysProvider {
   }
 
   private toLegacyId(jid?: string | null): string {
-    if (!jid) return '';
-    if (jid.endsWith(BAILEYS_INDIVIDUAL_SUFFIX)) {
-      return (
-        jid.slice(0, -BAILEYS_INDIVIDUAL_SUFFIX.length) +
-        LEGACY_INDIVIDUAL_SUFFIX
-      );
-    }
-    return jid;
+    return toLegacyIdOf(jid);
   }
 
   private toBaileysJid(legacyId: string): string {
-    if (legacyId.endsWith(LEGACY_INDIVIDUAL_SUFFIX)) {
-      return (
-        legacyId.slice(0, -LEGACY_INDIVIDUAL_SUFFIX.length) +
-        BAILEYS_INDIVIDUAL_SUFFIX
-      );
-    }
-    return legacyId;
+    return toBaileysJidOf(legacyId);
   }
 
   private jidUser(jid: string): string {
-    return jid.split('@')[0]?.split(':')[0] ?? jid;
+    return jidUserOf(jid);
   }
 
   /**

@@ -7,6 +7,8 @@ import { RealtimeGateway } from 'src/realtime/realtime.gateway';
 import { WhatsappGroup } from 'src/database/entities/whatsapp-group.entity';
 import { WhatsappConnectionsService } from '../services/whatsapp-connections.service';
 import { WhatsappCommandsService } from '../services/whatsapp-commands.service';
+import { pickChatName } from '../services/whatsapp-chat-name';
+import { WhatsappChatSummary } from 'shared/whatsapp-contracts';
 
 /**
  * --- Fixes de la ronda de revisión (items 4 y 5) ---
@@ -18,6 +20,18 @@ import { WhatsappCommandsService } from '../services/whatsapp-commands.service';
  *      lo que ya había si es más reciente que lo que trae este sync.
  *  (5) `getUnreadTotal` reemplaza el cálculo que solo sumaba
  *      whatsapp_chat: ahora suma también los grupos de la conexión.
+ */
+/**
+ * --- Orden y notificaciones ---
+ *  `syncAll` ahora procesa PRIMERO todos los chats 1:1 y DESPUÉS todos los
+ *  grupos. Con `notify: true` emite por WebSocket `whatsapp:chats-synced`
+ *  al terminar los chats y `whatsapp:groups-synced` al terminar los grupos
+ *  (dos avisos separados). Sin `notify` (refrescos en background) no emite
+ *  ninguno, para no provocar bucles con un frontend que recarga al recibirlos.
+ *
+ * --- Chats duplicados (LID / PN) ---
+ *  Si el runtime informa `aliases` (ids `@lid` de la misma persona), los
+ *  chats duplicados ya guardados en la BD se fusionan en el canónico.
  */
 @Injectable()
 export class WhatsappSyncService {
@@ -35,18 +49,58 @@ export class WhatsappSyncService {
     private readonly whatsappConnectionsService: WhatsappConnectionsService,
   ) {}
 
-  async syncAll(sessionId: string) {
+  async syncAll(sessionId: string, opts: { notify?: boolean } = {}) {
     // sessionId aquí ES connectionId — se mantiene el nombre por las
     // columnas de BD (WhatsappChat.sessionId), no por el contrato con el runtime.
-    const allChats = await this.commandsService.syncAll(sessionId);
+    let allChats: Awaited<ReturnType<WhatsappCommandsService['syncAll']>>;
+    try {
+      allChats = await this.commandsService.syncAll(sessionId);
+    } catch (e) {
+      this.logger.debug(`Sync omitido para ${sessionId}: ${e.message}`);
+      return; // no hay conexión activa o falló el comando — nada que sincronizar
+    }
 
-    const chatIds = allChats.filter((c) => !c.isGroup).map((c) => c.chatId);
-    const groupIds = allChats.filter((c) => c.isGroup).map((c) => c.chatId);
+    const chats = allChats.filter((c) => !c.isGroup);
+    const groups = allChats.filter((c) => c.isGroup);
+
+    const connection =
+      await this.whatsappConnectionsService.findByConnectionId(sessionId);
+    const whatsappConnectionId = connection?.id ?? null;
+
+    // Solo se notifica si el runtime devolvió algo: con la memoria del
+    // runtime vacía (recién conectado, historial aún sin llegar) avisar
+    // "sincronizado" con 0 chats sería falso.
+    const notify = !!opts.notify && allChats.length > 0;
+
+    // 0) duplicados ya guardados (mismo contacto como @lid y como @c.us)
+    await this.mergeDuplicateChats(sessionId, chats);
+
+    // 1) CHATS primero
+    await this.syncConversations(sessionId, chats, whatsappConnectionId);
+    if (notify)
+      this.gateway.emitChatsSynced(sessionId, { total: chats.length });
+
+    // 2) GRUPOS después
+    await this.syncConversations(sessionId, groups, whatsappConnectionId);
+    if (notify)
+      this.gateway.emitGroupsSynced(sessionId, { total: groups.length });
+  }
+
+  /** Sincroniza una lista homogénea (solo chats o solo grupos) de summaries. */
+  private async syncConversations(
+    sessionId: string,
+    list: WhatsappChatSummary[],
+    whatsappConnectionId: string | null,
+  ) {
+    if (!list.length) return;
+
+    const chatIds = list.filter((c) => !c.isGroup).map((c) => c.chatId);
+    const groupIds = list.filter((c) => c.isGroup).map((c) => c.chatId);
 
     const existingChats = chatIds.length
       ? await this.chatRepo.find({
           where: { sessionId, chatId: In(chatIds) },
-          select: ['chatId', 'isNew', 'lastMessageAt', 'lastMessage'],
+          select: ['chatId', 'name', 'isNew', 'lastMessageAt', 'lastMessage'],
         })
       : [];
     const existingChatsMap = new Map(existingChats.map((c) => [c.chatId, c]));
@@ -54,18 +108,14 @@ export class WhatsappSyncService {
     const existingGroups = groupIds.length
       ? await this.groupRepo.find({
           where: { whatsappGroupId: In(groupIds) },
-          select: ['whatsappGroupId', 'lastMessageAt', 'lastMessage'],
+          select: ['whatsappGroupId', 'title', 'lastMessageAt', 'lastMessage'],
         })
       : [];
     const existingGroupsMap = new Map(
       existingGroups.map((g) => [g.whatsappGroupId, g]),
     );
 
-    const connection =
-      await this.whatsappConnectionsService.findByConnectionId(sessionId);
-    const whatsappConnectionId = connection?.id ?? null;
-
-    for (const c of allChats) {
+    for (const c of list) {
       const existingChat = !c.isGroup
         ? existingChatsMap.get(c.chatId)
         : undefined;
@@ -93,7 +143,7 @@ export class WhatsappSyncService {
         await this.groupRepo.upsert(
           {
             whatsappGroupId: c.chatId,
-            title: c.name,
+            title: pickChatName(existingGroup?.title, c.name, c.chatId),
             lastMessage: effectiveLastMessage,
             lastMessageAt: effectiveLastMessageAt,
             unreadCount: c.unreadCount,
@@ -105,7 +155,7 @@ export class WhatsappSyncService {
         if (isNewGroup) {
           this.gateway.emitNewGroup(sessionId, {
             whatsappGroupId: c.chatId,
-            title: c.name,
+            title: pickChatName(undefined, c.name, c.chatId),
             unreadCount: c.unreadCount,
           });
         }
@@ -115,7 +165,7 @@ export class WhatsappSyncService {
             {
               sessionId,
               chatId: c.chatId,
-              name: c.name,
+              name: pickChatName(existingChat?.name, c.name, c.chatId),
               lastMessage: effectiveLastMessage,
               lastMessageAt: effectiveLastMessageAt,
               unreadCount: c.unreadCount,
@@ -128,7 +178,7 @@ export class WhatsappSyncService {
         if (isNewChat) {
           this.gateway.emitNewChat(sessionId, {
             chatId: c.chatId,
-            name: c.name,
+            name: pickChatName(undefined, c.name, c.chatId),
             unreadCount: c.unreadCount,
           });
         }
@@ -151,6 +201,97 @@ export class WhatsappSyncService {
         );
       }
     }
+  }
+
+  /**
+   * Fusiona en el chat canónico (`@c.us`) los chats duplicados que la BD
+   * pueda tener bajo su alias `@lid`: mueve sus mensajes y borra el chat
+   * sobrante. En los syncs siguientes no encuentra nada y solo cuesta 2
+   * consultas por lote.
+   */
+  private async mergeDuplicateChats(
+    sessionId: string,
+    chats: WhatsappChatSummary[],
+  ) {
+    const canonicalByAlias = new Map<string, string>();
+    for (const c of chats) {
+      for (const alias of c.aliases ?? []) {
+        if (alias !== c.chatId) canonicalByAlias.set(alias, c.chatId);
+      }
+    }
+    if (!canonicalByAlias.size) return;
+
+    const aliasIds = [...canonicalByAlias.keys()];
+    const withRows = new Set<string>();
+    for (let i = 0; i < aliasIds.length; i += 500) {
+      const ids = aliasIds.slice(i, i + 500);
+      const chatRows = await this.chatRepo.find({
+        where: { sessionId, chatId: In(ids) },
+        select: ['chatId'],
+      });
+      chatRows.forEach((r) => withRows.add(r.chatId));
+      const msgRows = await this.messageRepo
+        .createQueryBuilder('m')
+        .select('m.chatId', 'chatId')
+        .where('m.sessionId = :sessionId', { sessionId })
+        .andWhere('m.chatId IN (:...ids)', { ids })
+        .groupBy('m.chatId')
+        .getRawMany<{ chatId: string }>();
+      msgRows.forEach((r) => withRows.add(r.chatId));
+    }
+
+    for (const aliasId of withRows) {
+      const canonicalId = canonicalByAlias.get(aliasId)!;
+      try {
+        await this.mergeChatInto(sessionId, aliasId, canonicalId);
+      } catch (e) {
+        this.logger.warn(
+          `[${sessionId}] no se pudo fusionar ${aliasId} en ${canonicalId}: ${e.message}`,
+        );
+      }
+    }
+  }
+
+  private async mergeChatInto(
+    sessionId: string,
+    aliasId: string,
+    canonicalId: string,
+  ) {
+    const moved = await this.messageRepo.manager.transaction(async (em) => {
+      const msgRepo = em.getRepository(WhatsappMessage);
+      const aliasMsgs = await msgRepo.find({
+        where: { sessionId, chatId: aliasId },
+        select: ['messageId'],
+      });
+
+      // Si la BD permite el mismo messageId en ambos chats, se descartan los
+      // repetidos del alias en vez de chocar con el índice único.
+      for (let i = 0; i < aliasMsgs.length; i += 500) {
+        const ids = aliasMsgs.slice(i, i + 500).map((m) => m.messageId);
+        const dupes = await msgRepo.find({
+          where: { sessionId, chatId: canonicalId, messageId: In(ids) },
+          select: ['messageId'],
+        });
+        if (dupes.length) {
+          await msgRepo.delete({
+            sessionId,
+            chatId: aliasId,
+            messageId: In(dupes.map((d) => d.messageId)),
+          });
+        }
+      }
+      await msgRepo.update(
+        { sessionId, chatId: aliasId },
+        { chatId: canonicalId },
+      );
+      await em
+        .getRepository(WhatsappChat)
+        .delete({ sessionId, chatId: aliasId });
+      return aliasMsgs.length;
+    });
+    this.logger.log(
+      `[${sessionId}] chat duplicado ${aliasId} fusionado en ${canonicalId} (${moved} mensajes revisados)`,
+    );
   }
 
   async syncMessagesForChat(sessionId: string, chatId: string, limit = 50) {

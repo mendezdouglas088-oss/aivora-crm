@@ -11,10 +11,10 @@ export class WhatsappSyncProcessor extends WorkerHost {
     super();
   }
 
-  async process(job: Job<{ sessionId: string }>) {
-    const { sessionId } = job.data;
+  async process(job: Job<{ sessionId: string; notify?: boolean }>) {
+    const { sessionId, notify } = job.data;
     try {
-      await this.syncService.syncAll(sessionId);
+      await this.syncService.syncAll(sessionId, { notify: !!notify });
     } catch (err) {
       this.logger.error(`Sync falló para ${sessionId}: ${err?.message}`);
       throw err; // deja que BullMQ lo marque como failed/reintente si configuraste attempts

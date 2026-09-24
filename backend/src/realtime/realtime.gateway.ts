@@ -58,6 +58,18 @@ export class RealtimeGateway implements OnGatewayConnection {
     this.server.to(connectionId).emit('whatsapp:chat-updated', payload);
   }
 
+  emitChatsSynced(connectionId: string, payload: { total: number }) {
+    this.server
+      .to(connectionId)
+      .emit('whatsapp:chats-synced', { connectionId, ...payload });
+  }
+
+  emitGroupsSynced(connectionId: string, payload: { total: number }) {
+    this.server
+      .to(connectionId)
+      .emit('whatsapp:groups-synced', { connectionId, ...payload });
+  }
+
   emitNewChat(
     sessionId: string,
     chat: { chatId: string; name: string; unreadCount: number },

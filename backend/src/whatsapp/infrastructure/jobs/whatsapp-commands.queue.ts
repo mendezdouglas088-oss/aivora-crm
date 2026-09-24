@@ -59,8 +59,8 @@ export class WhatsappCommandsQueue implements OnModuleDestroy {
     const job = await this.queue.add(WHATSAPP_COMMAND_JOB_NAME, command, {
       attempts,
       backoff: attempts > 1 ? { type: 'exponential', delay: 3000 } : undefined,
-      removeOnComplete: true,
-      removeOnFail: 200,
+      removeOnComplete: { count: 1000 },
+      removeOnFail: { count: 1000 },
     });
 
     const result = await job.waitUntilFinished(this.queueEvents, timeoutMs);

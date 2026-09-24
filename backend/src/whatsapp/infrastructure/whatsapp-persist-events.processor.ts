@@ -2,53 +2,66 @@ import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Job } from 'bullmq';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { WhatsappChat } from 'src/database/entities/whatsapp-chat.entity';
 import { WhatsappMessage } from 'src/database/entities/whatsapp-message.entity';
 import { WhatsappGroup } from 'src/database/entities/whatsapp-group.entity';
 import { RealtimeGateway } from 'src/realtime/realtime.gateway';
 import {
+  WHATSAPP_HISTORY_BATCH_JOB_NAME,
+  WHATSAPP_HISTORY_DONE_JOB_NAME,
+  WHATSAPP_PERSIST_EVENT_JOB_NAME,
   WHATSAPP_PERSIST_EVENTS_QUEUE,
+  WhatsappHistoryBatchJob,
+  WhatsappHistoryDoneJob,
+  WhatsappMessagePersistPayload,
   WhatsappPersistEventJob,
 } from 'shared/whatsapp-contracts';
 import { WhatsappConnectionsService } from '../services/whatsapp-connections.service';
+import { pickChatName } from '../services/whatsapp-chat-name';
+import { WhatsappSyncQueue } from './jobs/whatsapp-sync.queue';
 
 /**
- * Mismo cuerpo que tenía `@OnEvent('whatsapp.message.persist')` en
- * whatsapp-events.listener.ts — solo que ahora consume una cola BullMQ
- * (la produce whatsapp-runtime.service.ts desde el otro proceso) en vez de
- * escuchar un emit local. Por eso ahora sí importan los reintentos: si
- * falla el guardado, BullMQ lo reintenta según la config del job
- * (definida en whatsapp-runtime.service.ts al encolar).
+ * Máximo de mensajes por INSERT. Postgres admite 65 535 parámetros por
+ * consulta y cada mensaje usa ~15 columnas: un solo INSERT con más de ~4 300
+ * mensajes falla completo. Un batch de historial puede traer miles.
+ */
+const INSERT_CHUNK = 500;
+
+interface ConversationResult {
+  /** El chat/grupo no existía antes de este upsert. */
+  isNew: boolean;
+  name: string;
+  lastMessage: string | null;
+  lastMessageAt: number | null;
+}
+
+/**
+ * Consume la cola BullMQ `whatsapp-persist-events` (la produce el runtime).
+ * Maneja tres tipos de job:
  *
- * Único cambio real de contenido: `payload.sessionId` → `payload.connectionId`,
- * porque el contrato compartido estandarizó ese nombre.
+ *  - `message-persist`      → un mensaje en vivo (`processSingleMessage`).
+ *  - `history-batch-persist`→ un lote de historial (`processHistoryBatch`).
+ *  - `history-sync-done`    → el runtime terminó de importar el historial.
  *
- * --- Fixes de la ronda de revisión (items 2, 3, 4 y 5) ---
- *  (4) Ya no se pisa `lastMessageAt`/`lastMessage` a ciegas: si lo que ya
- *      hay guardado es más nuevo que este evento (puede pasar si llega
- *      fuera de orden respecto al sync periódico), se conserva lo viejo.
- *  (3) Se detecta si el chat/grupo YA existía antes del upsert. Si es
- *      nuevo, se emite `emitNewChat`/`emitNewGroup` de inmediato en vez de
- *      esperar al próximo sync periódico (hasta 3 min de retraso antes).
- *      De paso, se completa `whatsappConnectionId` al crear un grupo desde
- *      un evento en vivo — antes quedaba en null hasta que corría el sync,
- *      y `findAllById(userId, connectionId)` no lo encontraba mientras tanto.
- *  (2) Se agrega `emitChatUpdated`, que dispara SIEMPRE que se inserta un
- *      mensaje nuevo (propio o ajeno). Antes `emitNewMessages` solo se
- *      disparaba para mensajes ajenos, así que enviar un mensaje (desde la
- *      API o desde el celular vinculado) no se reflejaba en tiempo real en
- *      otras pestañas/dispositivos conectados — solo se enteraban en el
- *      siguiente sync. `emitNewMessages` se conserva tal cual para el
- *      badge de no leídos, que sigue sin deber contar mensajes propios.
- *  (5) El total de no leídos que se emite ahora suma chats + grupos de la
- *      conexión (getUnreadTotal). Antes solo sumaba whatsapp_chat, así que
- *      un mensaje de grupo nunca se reflejaba en el total.
+ * `processSingleMessage` estaba como stub (`throw new Error('Method not
+ * implemented.')`): TODO mensaje en vivo fallaba, BullMQ lo reintentaba 4
+ * veces y lo descartaba sin llegar nunca a la BD. Su lógica es:
  *
- * OJO: `emitChatUpdated` es un método NUEVO que hay que agregar a
- * `RealtimeGateway` (src/realtime/realtime.gateway.ts) — ese archivo no
- * estaba en lo que se subió para revisión, así que no se pudo tocar acá.
- * Ver el mensaje de la conversación para el snippet sugerido.
+ *  - Inserta el mensaje con `orIgnore` (idempotente ante reintentos/ecos).
+ *  - Actualiza el último mensaje del chat/grupo SIN pisar uno más nuevo (un
+ *    evento fuera de orden respecto al sync no debe hacer "saltar" el chat).
+ *  - Si el chat/grupo es nuevo → `emitNewChat` / `emitNewGroup` de inmediato,
+ *    sin esperar al siguiente sync (hasta 3 min antes). Al crear un grupo se
+ *    completa `whatsappConnectionId`, si no `findAllById` no lo encuentra.
+ *  - `emitChatUpdated` SIEMPRE que se inserta un mensaje nuevo (propio o
+ *    ajeno), para que otras pestañas/dispositivos lo vean en tiempo real.
+ *  - `emitNewMessages` (badge de no leídos) solo para mensajes AJENOS, con
+ *    el total de chats + grupos (`getUnreadTotal`).
+ *  - Guardado + actualización del chat van en UNA transacción: si algo falla
+ *    a mitad, el reintento de BullMQ parte de cero (sin dejar el mensaje
+ *    guardado pero el chat sin actualizar, ni contar el no-leído dos veces).
+ *    Los eventos de socket se emiten DESPUÉS del commit.
  */
 @Injectable()
 @Processor(WHATSAPP_PERSIST_EVENTS_QUEUE)
@@ -64,155 +77,325 @@ export class WhatsappPersistEventsProcessor extends WorkerHost {
     private readonly groupRepo: Repository<WhatsappGroup>,
     private readonly gateway: RealtimeGateway,
     private readonly whatsappConnectionsService: WhatsappConnectionsService,
+    private readonly syncQueue: WhatsappSyncQueue,
   ) {
     super();
   }
 
-  async process(job: Job<WhatsappPersistEventJob>) {
-    const { payload } = job.data;
+  async process(job: Job<any>) {
+    switch (job.name) {
+      case WHATSAPP_HISTORY_BATCH_JOB_NAME:
+        return this.processHistoryBatch(job.data as WhatsappHistoryBatchJob);
+      case WHATSAPP_HISTORY_DONE_JOB_NAME:
+        return this.processHistoryDone(job.data as WhatsappHistoryDoneJob);
+      case WHATSAPP_PERSIST_EVENT_JOB_NAME:
+        return this.processSingleMessage(job.data as WhatsappPersistEventJob);
+      default:
+        // Compatibilidad con jobs viejos que quedaran en Redis sin nombre
+        // conocido: si traen un mensaje se guarda; si no, se descarta en
+        // vez de lanzar (un throw solo provocaría 4 reintentos inútiles).
+        if (job.data?.payload?.messageId) {
+          return this.processSingleMessage(job.data as WhatsappPersistEventJob);
+        }
+        this.logger.warn(`Job desconocido "${job.name}" descartado.`);
+    }
+  }
+
+  // ── mensaje en vivo ────────────────────────────────────────────────
+
+  private async processSingleMessage(data: WhatsappPersistEventJob) {
+    const m = data?.payload;
+    if (!m?.messageId || !m.chatId || !m.connectionId) {
+      this.logger.warn('message-persist sin payload válido; se descarta.');
+      return;
+    }
+
+    const connection = await this.whatsappConnectionsService
+      .findByConnectionId(m.connectionId)
+      .catch(() => null);
+    const dbConnectionId = connection?.id ?? null;
+
+    const stored = await this.messageRepo.manager.transaction(async (em) => {
+      const msgRepo = em.getRepository(WhatsappMessage);
+      const alreadyStored = await msgRepo.exists({
+        where: { sessionId: m.connectionId, messageId: m.messageId },
+      });
+      if (!alreadyStored) {
+        await this.insertMessages(em, [m]);
+      }
+
+      // Aunque el mensaje ya estuviera (reintento), se reaplica el último
+      // mensaje: es idempotente y repara un reintento tras fallo parcial.
+      const convo = await this.upsertConversation(em, m, dbConnectionId);
+
+      const countsAsUnread = !alreadyStored && !m.fromMe;
+      if (countsAsUnread) await this.incrementUnread(em, m);
+
+      return {
+        alreadyStored,
+        convo,
+        unreadCount: await this.readUnread(em, m),
+      };
+    });
+
+    // Reintento o eco de un mensaje ya guardado: no se vuelve a notificar.
+    if (stored.alreadyStored) return;
 
     try {
-      const result = await this.messageRepo
+      const { convo, unreadCount } = stored;
+      if (convo.isNew) {
+        if (m.isGroup) {
+          this.gateway.emitNewGroup(m.connectionId, {
+            whatsappGroupId: m.chatId,
+            title: convo.name,
+            unreadCount,
+          });
+        } else {
+          this.gateway.emitNewChat(m.connectionId, {
+            chatId: m.chatId,
+            name: convo.name,
+            unreadCount,
+          });
+        }
+      }
+
+      this.gateway.emitChatUpdated(m.connectionId, {
+        chatId: m.chatId,
+        isGroup: m.isGroup,
+        name: convo.name,
+        lastMessage: convo.lastMessage ?? m.body,
+        lastMessageAt: convo.lastMessageAt ?? m.timestamp,
+        unreadCount,
+        fromMe: m.fromMe,
+      });
+
+      if (!m.fromMe) {
+        const total = await this.getUnreadTotal(m.connectionId);
+        this.gateway.emitNewMessages(m.connectionId, m.chatId, 1, total);
+      }
+    } catch (e) {
+      // El mensaje YA está en la BD: un fallo de socket no debe reintentar
+      // el job (no aporta nada y solo repetiría trabajo).
+      this.logger.warn(
+        `Mensaje ${m.messageId} guardado, pero falló la notificación: ${e?.message ?? e}`,
+      );
+    }
+  }
+
+  // ── historial ──────────────────────────────────────────────────────
+
+  private async processHistoryBatch(data: WhatsappHistoryBatchJob) {
+    const messages = data?.messages ?? [];
+    if (!messages.length) return;
+
+    const connectionCache = new Map<string, string | null>();
+    const dbConnectionIdFor = async (connectionId: string) => {
+      if (!connectionCache.has(connectionId)) {
+        const c = await this.whatsappConnectionsService
+          .findByConnectionId(connectionId)
+          .catch(() => null);
+        connectionCache.set(connectionId, c?.id ?? null);
+      }
+      return connectionCache.get(connectionId)!;
+    };
+
+    // un batch de historial trae mensajes de varios chats mezclados —
+    // nos quedamos con el más nuevo POR CHAT dentro de este batch.
+    const latestByChat = new Map<string, WhatsappMessagePersistPayload>();
+    for (const m of messages) {
+      const key = `${m.connectionId}|${m.chatId}`;
+      const current = latestByChat.get(key);
+      if (!current || m.timestamp > current.timestamp) latestByChat.set(key, m);
+    }
+
+    const created = await this.messageRepo.manager.transaction(async (em) => {
+      await this.insertMessages(em, messages);
+
+      const newConversations: {
+        last: WhatsappMessagePersistPayload;
+        name: string;
+      }[] = [];
+      for (const last of latestByChat.values()) {
+        const convo = await this.upsertConversation(
+          em,
+          last,
+          await dbConnectionIdFor(last.connectionId),
+        );
+        if (convo.isNew) newConversations.push({ last, name: convo.name });
+      }
+      return newConversations;
+    });
+
+    // Los eventos de socket salen DESPUÉS del commit: si la transacción
+    // falla no se anuncian chats que no existen.
+    for (const { last, name } of created) {
+      if (last.isGroup) {
+        this.gateway.emitNewGroup(last.connectionId, {
+          whatsappGroupId: last.chatId,
+          title: name,
+          unreadCount: 0,
+        });
+      } else {
+        this.gateway.emitNewChat(last.connectionId, {
+          chatId: last.chatId,
+          name,
+          unreadCount: 0,
+        });
+      }
+    }
+  }
+
+  /**
+   * El runtime ya envió TODO el historial: primero todos los lotes de chats
+   * 1:1 y después todos los de grupos (la cola es FIFO). Falta reconciliar
+   * con el estado del runtime (chats sin mensajes, nombres, no leídos) y
+   * eso lo hace el sync completo, que además emite por WebSocket
+   * `whatsapp:chats-synced` cuando terminan los chats y, después,
+   * `whatsapp:groups-synced` cuando terminan los grupos.
+   */
+  private async processHistoryDone(data: WhatsappHistoryDoneJob) {
+    const { connectionId, totalChats, totalGroups } = data.payload;
+    this.logger.log(
+      `[${connectionId}] historial recibido (${totalChats} chats, ${totalGroups} grupos en memoria del runtime); lanzando sync completo.`,
+    );
+    await this.syncQueue.enqueueFullSync(connectionId);
+  }
+
+  // ── piezas compartidas ─────────────────────────────────────────────
+
+  private async insertMessages(
+    em: EntityManager,
+    messages: WhatsappMessagePersistPayload[],
+  ) {
+    const rows = messages.map((m) => ({
+      sessionId: m.connectionId,
+      chatId: m.chatId,
+      messageId: m.messageId,
+      fromMe: m.fromMe,
+      body: m.body,
+      timestamp: m.timestamp,
+      isRead: m.fromMe,
+      ack: m.ack,
+      isGroup: m.isGroup,
+      type: m.type,
+      hasMedia: m.hasMedia,
+      author: m.author,
+      authorName: m.authorName,
+      mentionsMe: m.mentionsMe,
+      serializedId: m.serializedId,
+    }));
+
+    for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
+      await em
+        .getRepository(WhatsappMessage)
         .createQueryBuilder()
         .insert()
-        .values({
-          sessionId: payload.connectionId,
-          chatId: payload.chatId,
-          messageId: payload.messageId,
-          fromMe: payload.fromMe,
-          body: payload.body,
-          timestamp: payload.timestamp,
-          isRead: payload.fromMe,
-          ack: payload.ack,
-          isGroup: payload.isGroup,
-          type: payload.type,
-          hasMedia: payload.hasMedia,
-          author: payload.author,
-          authorName: payload.authorName,
-          mentionsMe: payload.mentionsMe,
-          serializedId: payload.serializedId,
-        })
+        .into(WhatsappMessage)
+        .values(rows.slice(i, i + INSERT_CHUNK))
         .orIgnore()
         .execute();
-
-      const isNewMessageRow = result.identifiers.length > 0;
-      let isNewConversation = false;
-
-      if (payload.isGroup) {
-        // Vemos si el grupo ya existía ANTES de tocarlo: sirve tanto para
-        // no pisar un lastMessageAt más nuevo (fix 4) como para saber si
-        // hay que avisar por socket de un grupo nuevo (fix 3).
-        const existingGroup = await this.groupRepo.findOne({
-          where: { whatsappGroupId: payload.chatId },
-          select: ['lastMessageAt', 'lastMessage'],
-        });
-        isNewConversation = !existingGroup;
-
-        const isStale =
-          !!existingGroup?.lastMessageAt &&
-          existingGroup.lastMessageAt > payload.timestamp;
-
-        // Antes no se seteaba whatsappConnectionId acá: un grupo creado
-        // por primera vez desde un evento en vivo quedaba con esa columna
-        // en null y no aparecía en /whatsapp/groups (filtra por conexión)
-        // hasta que corría el sync periódico.
-        const connection = await this.whatsappConnectionsService
-          .findByConnectionId(payload.connectionId)
-          .catch(() => null);
-
-        await this.groupRepo.upsert(
-          [
-            {
-              whatsappGroupId: payload.chatId,
-              title: payload.chatName,
-              lastMessage: isStale ? existingGroup!.lastMessage : payload.body,
-              lastMessageAt: isStale
-                ? existingGroup!.lastMessageAt
-                : payload.timestamp,
-              unreadCount: payload.unreadCount,
-              whatsappConnectionId: connection?.id ?? null,
-            },
-          ],
-          ['whatsappGroupId'],
-        );
-
-        if (isNewConversation) {
-          this.gateway.emitNewGroup(payload.connectionId, {
-            whatsappGroupId: payload.chatId,
-            title: payload.chatName,
-            unreadCount: payload.unreadCount,
-          });
-        }
-      } else {
-        // no pisar isNew: si el chat ya existía, se conserva su valor actual
-        const existingChat = await this.chatRepo.findOne({
-          where: { sessionId: payload.connectionId, chatId: payload.chatId },
-          select: ['isNew', 'lastMessageAt', 'lastMessage'],
-        });
-        isNewConversation = !existingChat;
-
-        const isStale =
-          !!existingChat?.lastMessageAt &&
-          existingChat.lastMessageAt > payload.timestamp;
-
-        await this.chatRepo.upsert(
-          [
-            {
-              sessionId: payload.connectionId,
-              chatId: payload.chatId,
-              name: payload.chatName,
-              lastMessage: isStale ? existingChat!.lastMessage : payload.body,
-              lastMessageAt: isStale
-                ? existingChat!.lastMessageAt
-                : payload.timestamp,
-              unreadCount: payload.unreadCount,
-              isNew: existingChat ? existingChat.isNew : true,
-            },
-          ],
-          ['sessionId', 'chatId'],
-        );
-
-        if (isNewConversation) {
-          this.gateway.emitNewChat(payload.connectionId, {
-            chatId: payload.chatId,
-            name: payload.chatName,
-            unreadCount: payload.unreadCount,
-          });
-        }
-      }
-
-      if (isNewMessageRow) {
-        // Dispara SIEMPRE (propio o ajeno) para que cualquier
-        // pestaña/dispositivo conectado reordene la lista y refresque el
-        // preview del último mensaje.
-        this.gateway.emitChatUpdated(payload.connectionId, {
-          chatId: payload.chatId,
-          isGroup: payload.isGroup,
-          name: payload.chatName,
-          lastMessage: payload.body,
-          lastMessageAt: payload.timestamp,
-          unreadCount: payload.unreadCount,
-          fromMe: payload.fromMe,
-        });
-
-        if (!payload.fromMe) {
-          // Este sí sigue siendo específico de "mensajes nuevos sin leer";
-          // no debe dispararse con mensajes propios.
-          const total = await this.getUnreadTotal(payload.connectionId);
-          this.gateway.emitNewMessages(
-            payload.connectionId,
-            payload.chatId,
-            1,
-            total,
-          );
-        }
-      }
-    } catch (err) {
-      this.logger.error(
-        `Falló al persistir mensaje ${payload.messageId} de ${payload.connectionId}: ${err.message}`,
-      );
-      throw err; // deja que BullMQ reintente según la config del job
     }
+  }
+
+  /**
+   * Upsert del chat o grupo con el último mensaje `last`, conservando lo ya
+   * guardado si es más nuevo (evento fuera de orden) y sin degradar el nombre.
+   */
+  private async upsertConversation(
+    em: EntityManager,
+    last: WhatsappMessagePersistPayload,
+    dbConnectionId: string | null,
+  ): Promise<ConversationResult> {
+    if (last.isGroup) {
+      const repo = em.getRepository(WhatsappGroup);
+      const existing = await repo.findOne({
+        where: { whatsappGroupId: last.chatId },
+        select: ['whatsappGroupId', 'title', 'lastMessage', 'lastMessageAt'],
+      });
+      const stale =
+        !!existing?.lastMessageAt &&
+        Number(existing.lastMessageAt) > last.timestamp;
+      const title = pickChatName(existing?.title, last.chatName, last.chatId);
+      const lastMessage = stale ? existing!.lastMessage : last.body;
+      const lastMessageAt = stale
+        ? Number(existing!.lastMessageAt)
+        : last.timestamp;
+
+      await repo.upsert(
+        {
+          whatsappGroupId: last.chatId,
+          title,
+          lastMessage,
+          lastMessageAt,
+          // solo se escribe si se conoce: no pisar con null uno ya guardado
+          ...(dbConnectionId ? { whatsappConnectionId: dbConnectionId } : {}),
+        },
+        ['whatsappGroupId'],
+      );
+      return { isNew: !existing, name: title, lastMessage, lastMessageAt };
+    }
+
+    const repo = em.getRepository(WhatsappChat);
+    const existing = await repo.findOne({
+      where: { sessionId: last.connectionId, chatId: last.chatId },
+      select: ['isNew', 'name', 'lastMessageAt', 'lastMessage'],
+    });
+    const stale =
+      !!existing?.lastMessageAt &&
+      Number(existing.lastMessageAt) > last.timestamp;
+    const name = pickChatName(existing?.name, last.chatName, last.chatId);
+    const lastMessage = stale ? existing!.lastMessage : last.body;
+    const lastMessageAt = stale
+      ? Number(existing!.lastMessageAt)
+      : last.timestamp;
+
+    await repo.upsert(
+      {
+        sessionId: last.connectionId,
+        chatId: last.chatId,
+        name,
+        lastMessage,
+        lastMessageAt,
+        isNew: existing ? existing.isNew : true,
+      },
+      ['sessionId', 'chatId'],
+    );
+    return { isNew: !existing, name, lastMessage, lastMessageAt };
+  }
+
+  private async incrementUnread(
+    em: EntityManager,
+    m: WhatsappMessagePersistPayload,
+  ) {
+    if (m.isGroup) {
+      await em
+        .getRepository(WhatsappGroup)
+        .increment({ whatsappGroupId: m.chatId }, 'unreadCount', 1);
+    } else {
+      await em
+        .getRepository(WhatsappChat)
+        .increment(
+          { sessionId: m.connectionId, chatId: m.chatId },
+          'unreadCount',
+          1,
+        );
+    }
+  }
+
+  private async readUnread(
+    em: EntityManager,
+    m: WhatsappMessagePersistPayload,
+  ): Promise<number> {
+    const row = m.isGroup
+      ? await em.getRepository(WhatsappGroup).findOne({
+          where: { whatsappGroupId: m.chatId },
+          select: ['unreadCount'],
+        })
+      : await em.getRepository(WhatsappChat).findOne({
+          where: { sessionId: m.connectionId, chatId: m.chatId },
+          select: ['unreadCount'],
+        });
+    return Number(row?.unreadCount ?? 0);
   }
 
   /**

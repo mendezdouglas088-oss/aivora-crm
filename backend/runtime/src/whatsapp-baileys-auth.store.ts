@@ -58,15 +58,18 @@ export class WhatsappBaileysAuthStore implements OnModuleInit, OnModuleDestroy {
       user: process.env.DATABASE_USER || 'postgres',
       password: process.env.DATABASE_PASSWORD || 'postgres',
       database: process.env.DATABASE_NAME || 'crm_whatsapp',
+      connectionTimeoutMillis: 10_000,
+    });
+    this.pool.on('error', (err) => {
+      this.logger.error(
+        `Error inesperado en el pool de Postgres: ${err.message}`,
+      );
     });
   }
 
   async onModuleInit(): Promise<void> {
-    // CREATE TABLE IF NOT EXISTS por simplicidad, mismo criterio pragmático
-    // que ya usaba whatsapp_session_blobs (whatsapp-remote-auth.store.ts) —
-    // cuando formalicen migraciones, debería pasar a vivir en una de
-    // TypeORM como las demás.
-    await this.pool.query(`
+    await this.runWithRetry(() =>
+      this.pool.query(`
       CREATE TABLE IF NOT EXISTS whatsapp_baileys_auth (
         connection_id TEXT NOT NULL,
         key_id TEXT NOT NULL,
@@ -74,8 +77,28 @@ export class WhatsappBaileysAuthStore implements OnModuleInit, OnModuleDestroy {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (connection_id, key_id)
       );
-    `);
+    `),
+    );
     this.logger.log('Tabla whatsapp_baileys_auth verificada');
+  }
+
+  private async runWithRetry<T>(
+    fn: () => Promise<T>,
+    attempts = 5,
+    delayMs = 2000,
+  ): Promise<T> {
+    for (let i = 1; i <= attempts; i++) {
+      try {
+        return await fn();
+      } catch (e) {
+        if (i === attempts) throw e;
+        this.logger.warn(
+          `Postgres no respondió (intento ${i}/${attempts}): ${e.message}. Reintentando en ${delayMs}ms...`,
+        );
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+    throw new Error('unreachable');
   }
 
   async onModuleDestroy(): Promise<void> {

@@ -33,7 +33,8 @@ export class WhatsappEventsListener {
     );
 
     if (payload.status === 'connected') {
-      await this.syncQueue.enqueueSync(payload.connectionId);
+      // full = notifica chats-synced / groups-synced al terminar
+      await this.syncQueue.enqueueFullSync(payload.connectionId);
       await this.syncQueue.scheduleRecurringSync(payload.connectionId);
     }
     if (payload.status === 'disconnected') {

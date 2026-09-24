@@ -12,6 +12,7 @@ import {
   ParseIntPipe,
   Param,
   HttpStatus,
+  Logger,
 } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtAuthGuard } from 'src/auth/guards/jwt-auth.guard';
@@ -25,6 +26,8 @@ import { WhatsappCommandsService } from '../services/whatsapp-commands.service';
 @UseGuards(JwtAuthGuard)
 @Controller('whatsapp')
 export class WhatsappController {
+  private readonly logger = new Logger(WhatsappController.name);
+
   constructor(
     private readonly commands: WhatsappCommandsService,
     private readonly whatsappGroupService: WhatsappGroupService,
@@ -220,7 +223,12 @@ export class WhatsappController {
     @Query('connectionId') connectionId: string,
     @Param('messageId') messageId: string,
   ) {
-    return await this.commands.getMedia(connectionId, messageId);
+    try {
+      return (await this.commands.getMedia(connectionId, messageId)) ?? null;
+    } catch (error) {
+      this.logger.warn(`getMedia falló para ${messageId}: ${error.message}`);
+      return null;
+    }
   }
 
   @Get('chats/new')

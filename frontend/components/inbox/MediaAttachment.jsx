@@ -35,8 +35,9 @@ export function MediaAttachment({
       const res = await apiFetch(
         `/whatsapp/media/${encodeURIComponent(serializedId)}?connectionId=${connectionId}`,
       );
-      const data = await res.json();
-      if (!data) {
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : null;
+      if (!res.ok || !data?.data) {
         setState("unavailable");
         return;
       }
@@ -46,7 +47,7 @@ export function MediaAttachment({
       setState("ready");
     } catch (err) {
       console.error("Error cargando media", err);
-      requestedRef.current = false; // permite reintentar
+      requestedRef.current = false;
       setState("error");
     }
   }

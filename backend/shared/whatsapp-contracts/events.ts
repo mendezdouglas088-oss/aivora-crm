@@ -1,5 +1,6 @@
 import {
   WhatsappConnectionStatus,
+  WhatsappHistorySyncDonePayload,
   WhatsappMessagePersistPayload,
 } from './types';
 
@@ -20,6 +21,17 @@ export const WHATSAPP_PERSIST_EVENT_JOB_NAME = 'message-persist';
  * que `realtime.gateway.ts` ya escucha hoy — por eso el gateway no cambia.
  */
 export const WHATSAPP_LIVE_EVENTS_CHANNEL = 'whatsapp-live-events';
+
+export const WHATSAPP_HISTORY_BATCH_JOB_NAME = 'history-batch-persist';
+export const WHATSAPP_HISTORY_DONE_JOB_NAME = 'history-sync-done';
+
+export interface WhatsappHistoryBatchJob {
+  messages: WhatsappMessagePersistPayload[];
+}
+
+export interface WhatsappHistoryDoneJob {
+  payload: WhatsappHistorySyncDonePayload;
+}
 
 export interface WhatsappQrEvent {
   kind: 'qr';

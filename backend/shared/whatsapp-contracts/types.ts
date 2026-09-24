@@ -25,6 +25,12 @@ export type WhatsappMessageType =
   | 'vcard'
   | 'unknown';
 
+export interface WhatsappHistorySyncDonePayload {
+  connectionId: string;
+  totalChats: number;
+  totalGroups: number;
+}
+
 export type WhatsappConnectionStatus =
   | 'disconnected'
   | 'connecting'
@@ -102,6 +108,11 @@ export interface WhatsappChatSummary {
   unreadCount: number;
   participantsCount?: number;
   isSavedContact?: boolean;
+  /**
+   * Otros ids (`@lid`) que el runtime sabe que son la MISMA persona que
+   * `chatId`. La API los usa para fusionar chats duplicados ya guardados.
+   */
+  aliases?: string[];
 }
 
 /**
